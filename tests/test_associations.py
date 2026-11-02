@@ -176,6 +176,43 @@ class AssociationTests(unittest.TestCase):
         self.assertEqual(self.association_file.read_bytes(), original)
         self.assertEqual(self.server.dialogs, ["database-a"])
 
+    def test_wrong_database_does_not_consume_legacy_key(self):
+        self.legacy_file()
+        original = self.association_file.read_bytes()
+        self.server.active = "database-b"
+        status, stdout, stderr = self.run_cli("--uuid", "bbb", "--no-prompt")
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("Database not associated", stderr)
+        self.assertEqual(self.association_file.read_bytes(), original)
+        self.server.active = "database-a"
+        self.lookup("aaa", "password-a")
+
+    def test_switching_tabs_during_pair_does_not_save_under_wrong_database(self):
+        self.pair()
+        original = self.association_file.read_bytes()
+        self.server.active = "database-b"
+        connection = self.server.connect()
+        with patch.object(connection, "get_databasehash", side_effect=["database-b", "database-a"]), \
+                patch.object(app, "connect", return_value=connection):
+            status, stdout, stderr = self.run_cli("--pair")
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("Active database changed", stderr)
+        self.assertEqual(self.association_file.read_bytes(), original)
+
+    def test_switching_tabs_during_migration_preserves_legacy_key(self):
+        self.legacy_file()
+        original = self.association_file.read_bytes()
+        connection = self.server.connect()
+        with patch.object(connection, "get_databasehash", side_effect=["database-a", "database-b"]), \
+                patch.object(app, "connect", return_value=connection):
+            status, stdout, stderr = self.run_cli("--uuid", "aaa", "--no-prompt")
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("Active database changed", stderr)
+        self.assertEqual(self.association_file.read_bytes(), original)
+
     def test_revoked_association_can_be_repaired_without_losing_other_database(self):
         self.pair()
         self.server.active = "database-b"
@@ -220,6 +257,24 @@ class AssociationTests(unittest.TestCase):
         self.server.active = "database-b"
         self.pair()
         self.assertEqual(stat.S_IMODE(self.association_file.stat().st_mode), 0o600)
+
+    def test_legacy_migration_makes_store_private(self):
+        self.legacy_file()
+        self.association_file.chmod(0o644)
+        self.lookup("aaa", "password-a")
+        self.assertEqual(stat.S_IMODE(self.association_file.stat().st_mode), 0o600)
+
+    def test_unavailable_keepassxc_keeps_store_and_terminal_fallback(self):
+        self.pair()
+        original = self.association_file.read_bytes()
+        with patch.object(app, "connect", side_effect=OSError("Unavailable")), \
+                patch.object(app.getpass, "getpass", return_value="fallback") as prompt:
+            status, stdout, stderr = self.run_cli("--uuid", "aaa")
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout, "fallback\n")
+        self.assertIn("Unavailable", stderr)
+        prompt.assert_called_once_with("Password: ")
+        self.assertEqual(self.association_file.read_bytes(), original)
 
     def test_invalid_store_is_not_overwritten(self):
         self.config_dir.mkdir()

@@ -106,6 +106,8 @@ def restore_association(connection, associations: dict, database_hash: str) -> b
     connection.load_associate(association["name"], base64.b64decode(association["public_key"]))
     connection.test_associate()
     if legacy:
+        if connection.get_databasehash() != database_hash:
+            raise RuntimeError("Active database changed while migrating the association; try again")
         associations["databases"][database_hash] = association
         del associations["legacy"]
         save_associations(associations)
