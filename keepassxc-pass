@@ -1,0 +1,199 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["keepassxc-proxy-client"]
+# ///
+"""Print a password from the running KeePassXC via its browser integration.
+
+The entry is selected by UUID. The browser integration can only search by URL,
+so all entries used with this tool share one URL (default
+https://cli.keepassxc) and the UUID picks the right one.
+
+Settings (later wins): built-in defaults, ~/.config/keepassxc-pass/config.toml,
+the nearest .keepassxc.toml found upward from the current directory (or
+--config), command-line flags. Keys: uuid, url, prompt.
+
+If KeePassXC is not running, locked or does not return the entry, the
+password is read from the terminal instead (unless --no-prompt is given).
+Only the password is written to stdout.
+"""
+
+import argparse
+import base64
+import getpass
+import json
+import os
+import sys
+import tempfile
+import tomllib
+from pathlib import Path
+
+CONFIG_NAME = ".keepassxc.toml"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "keepassxc-pass"
+GLOBAL_CONFIG = CONFIG_DIR / "config.toml"
+ASSOCIATION_FILE = CONFIG_DIR / "association.json"
+DEFAULTS = {"url": "https://cli.keepassxc", "prompt": "Password: "}
+
+
+def find_local_config(start: Path) -> Path | None:
+    for directory in (start, *start.parents):
+        candidate = directory / CONFIG_NAME
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_settings(args: argparse.Namespace) -> dict:
+    settings = dict(DEFAULTS)
+    local = args.config or find_local_config(Path.cwd())
+    for path in (GLOBAL_CONFIG, local):
+        if path and path.is_file():
+            with path.open("rb") as f:
+                settings.update(tomllib.load(f))
+    for key in ("uuid", "url", "prompt"):
+        if getattr(args, key):
+            settings[key] = getattr(args, key)
+    return settings
+
+
+def connect():
+    from keepassxc_proxy_client import protocol
+
+    connection = protocol.Connection()
+    connection.connect()
+    return connection
+
+
+def load_associations() -> dict:
+    if not ASSOCIATION_FILE.exists():
+        return {"databases": {}}
+    data = json.loads(ASSOCIATION_FILE.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid association file: {ASSOCIATION_FILE}")
+    if "name" in data and "public_key" in data:
+        # The old format has no database hash. Keep it until its database is
+        # active and test_associate() confirms where it belongs.
+        return {"databases": {}, "legacy": data}
+    if not isinstance(data.get("databases"), dict):
+        raise ValueError(f"Invalid association file: {ASSOCIATION_FILE}")
+    return data
+
+
+def save_associations(associations: dict) -> None:
+    CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Write a private temporary file and replace atomically so an interrupted
+    # update cannot truncate the keys for every database.
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=CONFIG_DIR, prefix=".association-", delete=False
+    ) as f:
+        temporary = Path(f.name)
+        try:
+            json.dump(associations, f)
+            f.write("\n")
+            f.close()
+            os.replace(temporary, ASSOCIATION_FILE)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def restore_association(connection, associations: dict, database_hash: str) -> bool:
+    association = associations["databases"].get(database_hash)
+    legacy = association is None
+    if legacy:
+        association = associations.get("legacy")
+    if association is None:
+        return False
+    connection.load_associate(association["name"], base64.b64decode(association["public_key"]))
+    connection.test_associate()
+    if legacy:
+        associations["databases"][database_hash] = association
+        del associations["legacy"]
+        save_associations(associations)
+    return True
+
+
+def pair() -> int:
+    from keepassxc_proxy_client.protocol import ResponseUnsuccesfulException
+
+    associations = load_associations()
+    connection = connect()
+    database_hash = connection.get_databasehash()
+    try:
+        paired = restore_association(connection, associations, database_hash)
+    except ResponseUnsuccesfulException:
+        paired = False  # --pair can also replace a revoked association.
+    if paired:
+        print("Already paired with the active database", file=sys.stderr)
+        return 0
+
+    connection.associate()  # opens the confirmation dialog in KeePassXC
+    connection.test_associate()
+    if connection.get_databasehash() != database_hash:
+        raise RuntimeError("Active database changed while pairing; run --pair again")
+    name, public_key = connection.dump_associate()
+    associations["databases"][database_hash] = {
+        "name": name, "public_key": base64.b64encode(public_key).decode()
+    }
+    save_associations(associations)
+    print(f"Paired as '{name}' with the active database, association stored in {ASSOCIATION_FILE}", file=sys.stderr)
+    return 0
+
+
+def from_keepassxc(url: str, uuid: str) -> str | None:
+    associations = load_associations()
+    connection = connect()
+    database_hash = connection.get_databasehash()
+    if not restore_association(connection, associations, database_hash):
+        raise RuntimeError("Active database is not paired: run keepassxc-pass --pair")
+    for entry in connection.get_logins(url) or []:
+        if entry.get("uuid", "").lower() == uuid:
+            return entry["password"]
+    return None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--uuid", help="UUID of the KeePassXC entry")
+    parser.add_argument("--url", help=f"URL shared by the entries (default: {DEFAULTS['url']})")
+    parser.add_argument("--prompt", help="label for the terminal fallback")
+    parser.add_argument("--config", type=Path, help=f"config file instead of searching for {CONFIG_NAME}")
+    parser.add_argument("--no-prompt", action="store_true", help="fail instead of asking in the terminal")
+    parser.add_argument("--pair", action="store_true", help="pair with the active KeePassXC database (once per database)")
+    args = parser.parse_args()
+
+    if args.pair:
+        try:
+            return pair()
+        except Exception as error:
+            print(f"KeePassXC: {error}", file=sys.stderr)
+            return 1
+
+    settings = load_settings(args)
+    uuid = str(settings.get("uuid", "")).replace("-", "").lower()
+    if not uuid:
+        print(f"No UUID: pass --uuid or create {CONFIG_NAME}", file=sys.stderr)
+        return 2
+
+    if ASSOCIATION_FILE.is_file():
+        try:
+            password = from_keepassxc(settings["url"], uuid)
+        except Exception as error:  # not running, locked or invalid association
+            print(f"KeePassXC: {error}", file=sys.stderr)
+            password = None
+        if password:
+            print(password)
+            return 0
+        print(f"KeePassXC returned no password for {settings['url']} (UUID {uuid})", file=sys.stderr)
+    else:
+        print("Not paired yet: run keepassxc-pass --pair", file=sys.stderr)
+
+    if args.no_prompt:
+        return 1
+    print(getpass.getpass(settings["prompt"]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
