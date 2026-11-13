@@ -36,11 +36,24 @@ class FakeKeePassXC:
             "database-a": [{"uuid": "aaa", "password": "password-a"}],
             "database-b": [{"uuid": "bbb", "password": "password-b"}],
         }
+        # KeePassXC: browser integration → Advanced → "Search in all opened databases".
+        self.search_all = False
+        self.unlocked = {"database-a", "database-b"}
+        self.requests = []
+
+    def key_matches(self, database, keys):
+        authorization = self.authorizations.get(database)
+        if authorization is None:
+            return False
+        name, public_key = authorization
+        return {"id": name, "key": base64.b64encode(public_key).decode()} in keys
 
     def connect(self):
         server = self
 
         class Connection:
+            associated = False  # KeePassXC answers get-logins only after test-associate
+
             def get_databasehash(self):
                 return server.active
 
@@ -50,7 +63,27 @@ class FakeKeePassXC:
             def test_associate(self):
                 if self.association != server.authorizations.get(server.active):
                     raise NotAssociated("Database not associated")
+                self.associated = True
                 return True
+
+            def send_encrypted_message(self, message):
+                server.requests.append(message)
+                self.message = message
+
+            def get_encrypted_response(self):
+                if self.message["action"] != "get-logins" or not self.associated:
+                    raise NotAssociated("Association failed")
+                keys = self.message["keys"]
+                databases = sorted(server.unlocked) if server.search_all else [server.active]
+                entries = [
+                    entry
+                    for database in databases
+                    if database in server.unlocked and server.key_matches(database, keys)
+                    for entry in server.logins[database]
+                ] if self.message["url"] == "https://cli.keepassxc" else []
+                if not entries:
+                    raise NotAssociated("No logins found")
+                return {"success": True, "count": len(entries), "entries": entries}
 
             def associate(self):
                 server.dialogs.append(server.active)
@@ -60,10 +93,6 @@ class FakeKeePassXC:
 
             def dump_associate(self):
                 return self.association
-
-            def get_logins(self, url):
-                self.test_associate()
-                return server.logins[server.active] if url == "https://cli.keepassxc" else []
 
         return Connection()
 
@@ -287,6 +316,66 @@ class AssociationTests(unittest.TestCase):
                 self.assertTrue(stderr)
                 self.assertEqual(self.association_file.read_text(), contents)
         self.assertEqual(self.server.dialogs, [])
+
+    def pair_both(self):
+        self.pair()
+        self.server.active = "database-b"
+        self.pair()
+        self.server.active = "database-a"
+
+    def test_search_in_all_databases_finds_entry_in_background_database(self):
+        self.pair_both()
+        self.server.search_all = True
+        self.lookup("bbb", "password-b")  # database-a is the active tab
+        self.lookup("aaa", "password-a")
+        self.assertEqual(self.server.dialogs, ["database-a", "database-b"])
+
+    def test_lookup_sends_every_paired_key_active_first(self):
+        self.pair_both()
+        self.lookup("aaa", "password-a")
+        stored = app.load_associations()["databases"]
+        expected = [
+            {"id": stored[h]["name"], "key": stored[h]["public_key"]}
+            for h in ("database-a", "database-b")
+        ]
+        self.assertEqual(self.server.requests[-1]["keys"], expected)
+
+    def test_without_search_in_all_only_active_database_is_searched(self):
+        self.pair_both()
+        status, stdout, stderr = self.run_cli("--uuid", "bbb", "--no-prompt")
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("Search in all opened databases", stderr)
+        self.server.active = "database-b"
+        self.lookup("bbb", "password-b")
+
+    def test_locked_background_database_is_not_searched(self):
+        self.pair_both()
+        self.server.search_all = True
+        self.server.unlocked = {"database-a"}
+        status, stdout, stderr = self.run_cli("--uuid", "bbb", "--no-prompt")
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("returned no password", stderr)
+
+    def test_unpaired_active_database_fails_even_with_search_in_all(self):
+        self.server.active = "database-b"
+        self.pair()
+        self.server.active = "database-a"
+        self.server.search_all = True
+        status, stdout, stderr = self.run_cli("--uuid", "bbb", "--no-prompt")
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("Active database is not paired", stderr)
+        self.assertEqual(self.server.dialogs, ["database-b"])
+
+    def test_legacy_key_is_sent_until_migrated(self):
+        self.legacy_file()
+        self.server.active = "database-b"
+        self.pair()
+        self.server.search_all = True
+        self.lookup("aaa", "password-a")  # in database-a, reached via the legacy key
+        self.assertIn("legacy", app.load_associations())
 
     def test_missing_uuid_still_fails(self):
         with patch.object(app, "find_local_config", return_value=None):
