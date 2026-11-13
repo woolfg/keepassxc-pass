@@ -29,10 +29,20 @@ Adding a database keeps all previous associations. Running `--pair` for an
 already paired database reuses its authorization; if that authorization was
 removed in KeePassXC, it lets you pair again.
 
-Password lookups automatically select the saved association for the active
-KeePassXC database. Switch to the relevant database's tab before running the
-command. You do not need to delete `association.json` or re-authorize when
-switching between paired databases.
+Password lookups send the keys of **all** paired databases, so the entry can
+live in any of them, independent of the selected tab:
+
+- Enable *Settings → Browser Integration → Advanced → Search in all opened
+  databases for matching credentials* in KeePassXC. Then every unlocked,
+  paired database is searched and the UUID picks the entry.
+- Without that option, KeePassXC only searches the active database: switch to
+  the tab of the database that holds the entry before running the command.
+- Either way, the active tab must be a paired, unlocked database: KeePassXC
+  only answers after the tool proves its association with the active one.
+  Locked databases are never searched.
+
+You do not need to delete `association.json` or re-authorize when switching
+between paired databases.
 
 Existing single-database association files are migrated automatically when
 their database is used. You can pair a new database first: the old key is

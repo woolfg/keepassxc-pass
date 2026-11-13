@@ -9,6 +9,10 @@ The entry is selected by UUID. The browser integration can only search by URL,
 so all entries used with this tool share one URL (default
 https://cli.keepassxc) and the UUID picks the right one.
 
+The lookup sends the keys of all paired databases. With "Search in all opened
+databases" enabled in KeePassXC, the entry is found in any unlocked paired
+database, whichever tab is active (the active one must be paired, too).
+
 Settings (later wins): built-in defaults, ~/.config/keepassxc-pass/config.toml,
 the nearest .keepassxc.toml found upward from the current directory (or
 --config), command-line flags. Keys: uuid, url, prompt.
@@ -141,13 +145,47 @@ def pair() -> int:
     return 0
 
 
+def connection_keys(associations: dict, database_hash: str) -> list[dict]:
+    """Keys of every paired database, the active one first.
+
+    KeePassXC searches the databases whose key is in this list: only the
+    active one by default, every open (unlocked) one when "Search in all
+    opened databases" is enabled in its browser integration settings.
+    """
+    stored = associations["databases"]
+    ordered = [stored[database_hash]] if database_hash in stored else []
+    ordered += [a for h, a in stored.items() if h != database_hash]
+    if "legacy" in associations:
+        ordered.append(associations["legacy"])
+    keys, seen = [], set()
+    for association in ordered:
+        key = (association["name"], association["public_key"])
+        if key not in seen:
+            seen.add(key)
+            keys.append({"id": association["name"], "key": association["public_key"]})
+    return keys
+
+
+def get_logins(connection, url: str, keys: list[dict]) -> list[dict]:
+    # keepassxc-proxy-client's get_logins() sends only the key of the loaded
+    # association; send the request with every paired database's key instead.
+    connection.send_encrypted_message({"action": "get-logins", "url": url, "keys": keys})
+    response = connection.get_encrypted_response()
+    if not response.get("count"):
+        return []
+    return response.get("entries") or []
+
+
 def from_keepassxc(url: str, uuid: str) -> str | None:
     associations = load_associations()
     connection = connect()
     database_hash = connection.get_databasehash()
+    # KeePassXC only answers get-logins after a test-associate that succeeds
+    # for the active database, so that one must be paired; the entry itself
+    # may live in any other open paired database.
     if not restore_association(connection, associations, database_hash):
         raise RuntimeError("Active database is not paired: run keepassxc-pass --pair")
-    for entry in connection.get_logins(url) or []:
+    for entry in get_logins(connection, url, connection_keys(associations, database_hash)):
         if entry.get("uuid", "").lower() == uuid:
             return entry["password"]
     return None
@@ -188,6 +226,11 @@ def main() -> int:
             print(password)
             return 0
         print(f"KeePassXC returned no password for {settings['url']} (UUID {uuid})", file=sys.stderr)
+        print(
+            "If the entry is in another database: unlock it and enable \"Search in all opened"
+            " databases\" (KeePassXC browser integration, Advanced), or select its tab.",
+            file=sys.stderr,
+        )
     else:
         print("Not paired yet: run keepassxc-pass --pair", file=sys.stderr)
 
